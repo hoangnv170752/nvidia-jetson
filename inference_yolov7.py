@@ -19,7 +19,7 @@ YOLOV7_PATH = Path(__file__).parent / 'yolov7-main'
 if YOLOV7_PATH.exists():
     sys.path.insert(0, str(YOLOV7_PATH))
     
-    # Import YOLOv7 modules
+    # Import YOLOv7 modules (no torchvision dependency)
     try:
         from models.experimental import attempt_load
         from utils.general import check_img_size, non_max_suppression, scale_coords, xyxy2xywh
@@ -27,9 +27,11 @@ if YOLOV7_PATH.exists():
         from utils.torch_utils import select_device, time_synchronized
         from utils.datasets import letterbox
         YOLOV7_AVAILABLE = True
+        print("YOLOv7 modules loaded successfully (torchvision-free)")
     except ImportError as e:
         print(f"Warning: Could not import YOLOv7 modules: {e}")
         print("Make sure yolov7-main folder exists and contains the YOLOv7 source code")
+        print("Note: This script does NOT require torchvision")
         YOLOV7_AVAILABLE = False
 else:
     print(f"Warning: YOLOv7 source not found at {YOLOV7_PATH}")

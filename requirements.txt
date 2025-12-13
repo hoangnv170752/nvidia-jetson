@@ -5,9 +5,8 @@
 opencv-python>=4.5.0,<4.9.0
 numpy>=1.19.0,<1.25.0
 
-# For YOLOv7 (Python 3.8 compatible)
+# For YOLOv7 (Python 3.8 compatible) - No torchvision needed
 torch>=1.8.0,<2.1.0
-torchvision>=0.9.0,<0.16.0
 
 # For YOLO11 (Python 3.8 compatible)
 ultralytics>=8.0.0,<8.1.0

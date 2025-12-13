@@ -41,7 +41,6 @@ MANIFEST
 # *.tiff
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -75,3 +74,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
