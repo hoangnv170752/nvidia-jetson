@@ -1,8 +1,10 @@
 """
-YOLOv7 Inference Script
+YOLOv7 Inference Script using Official YOLOv7 Repository
 Supports image, video, and webcam inference
 """
 
+import sys
+import os
 import torch
 import cv2
 import numpy as np
@@ -10,11 +12,33 @@ from pathlib import Path
 import argparse
 import time
 
+# Add YOLOv7 source to path
+YOLOV7_PATH = Path(__file__).parent / 'yolov7-main'
+if YOLOV7_PATH.exists():
+    sys.path.insert(0, str(YOLOV7_PATH))
+    
+    # Import YOLOv7 modules
+    try:
+        from models.experimental import attempt_load
+        from utils.general import check_img_size, non_max_suppression, scale_coords, xyxy2xywh
+        from utils.plots import plot_one_box
+        from utils.torch_utils import select_device, time_synchronized
+        from utils.datasets import letterbox
+        YOLOV7_AVAILABLE = True
+    except ImportError as e:
+        print(f"Warning: Could not import YOLOv7 modules: {e}")
+        print("Make sure yolov7-main folder exists and contains the YOLOv7 source code")
+        YOLOV7_AVAILABLE = False
+else:
+    print(f"Warning: YOLOv7 source not found at {YOLOV7_PATH}")
+    print("Please ensure yolov7-main folder exists in the same directory as this script")
+    YOLOV7_AVAILABLE = False
+
 
 class YOLOv7Detector:
     def __init__(self, model_path, conf_threshold=0.25, iou_threshold=0.45, device=''):
         """
-        Initialize YOLOv7 detector
+        Initialize YOLOv7 detector using official YOLOv7 repository
         
         Args:
             model_path: Path to YOLOv7 .pt model file
@@ -22,171 +46,102 @@ class YOLOv7Detector:
             iou_threshold: IOU threshold for NMS
             device: Device to run inference on ('cpu', 'cuda', '0', '1', etc.)
         """
+        if not YOLOV7_AVAILABLE:
+            raise ImportError("YOLOv7 modules not available. Please ensure yolov7-main folder exists.")
+            
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         
-        # Set device
-        if device == '':
-            self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        else:
-            self.device = torch.device(device)
+        # Set device using YOLOv7's select_device function
+        self.device = select_device(device)
         
         print(f"Loading YOLOv7 model from {model_path}")
         print(f"Using device: {self.device}")
         
-        # Load model
-        self.model = torch.load(model_path, map_location=self.device)['model'].float()
-        self.model.to(self.device).eval()
-        
-        # Get model info
+        # Load model using YOLOv7's attempt_load function
+        self.model = attempt_load(model_path, map_location=self.device)
         self.stride = int(self.model.stride.max())
-        self.names = self.model.names if hasattr(self.model, 'names') else [f'class{i}' for i in range(1000)]
+        self.names = self.model.module.names if hasattr(self.model, 'module') else self.model.names
+        self.img_size = 640
+        
+        # Check image size
+        self.img_size = check_img_size(self.img_size, s=self.stride)
         
         print(f"Model loaded successfully. Classes: {len(self.names)}")
+        print(f"Image size: {self.img_size}, Stride: {self.stride}")
     
-    def letterbox(self, img, new_shape=(640, 640), color=(114, 114, 114)):
-        """Resize and pad image while maintaining aspect ratio"""
-        shape = img.shape[:2]  # current shape [height, width]
+    def preprocess(self, img0):
+        """Preprocess image for inference using YOLOv7's letterbox function"""
+        # Letterbox
+        img = letterbox(img0, self.img_size, stride=self.stride)[0]
         
-        # Scale ratio (new / old)
-        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        # Convert
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = np.ascontiguousarray(img)
         
-        # Compute padding
-        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
-        dw /= 2
-        dh /= 2
+        # Convert to tensor
+        img = torch.from_numpy(img).to(self.device)
+        img = img.float() / 255.0  # 0 - 255 to 0.0 - 1.0
+        if img.ndimension() == 3:
+            img = img.unsqueeze(0)
         
-        if shape[::-1] != new_unpad:
-            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-        
-        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-        
-        return img, r, (dw, dh)
+        return img
     
-    def preprocess(self, img):
-        """Preprocess image for inference"""
-        img_processed, ratio, pad = self.letterbox(img, new_shape=(640, 640))
-        img_processed = img_processed.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img_processed = np.ascontiguousarray(img_processed)
-        img_processed = torch.from_numpy(img_processed).to(self.device)
-        img_processed = img_processed.float() / 255.0
-        
-        if len(img_processed.shape) == 3:
-            img_processed = img_processed[None]
-        
-        return img_processed, ratio, pad
-    
-    def non_max_suppression(self, prediction, conf_thres=0.25, iou_thres=0.45, max_det=300):
-        """Perform Non-Maximum Suppression (NMS) on inference results"""
-        bs = prediction.shape[0]  # batch size
-        nc = prediction.shape[2] - 5  # number of classes
-        xc = prediction[..., 4] > conf_thres  # candidates
-        
-        output = [torch.zeros((0, 6), device=prediction.device)] * bs
-        
-        for xi, x in enumerate(prediction):
-            x = x[xc[xi]]
-            
-            if not x.shape[0]:
-                continue
-            
-            # Compute conf
-            x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
-            
-            # Box (center x, center y, width, height) to (x1, y1, x2, y2)
-            box = self.xywh2xyxy(x[:, :4])
-            
-            # Detections matrix nx6 (xyxy, conf, cls)
-            conf, j = x[:, 5:].max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
-            
-            # Apply NMS
-            if x.shape[0]:
-                c = x[:, 5:6] * 4096  # classes
-                boxes, scores = x[:, :4] + c, x[:, 4]
-                i = torch.ops.torchvision.nms(boxes, scores, iou_thres)
-                if i.shape[0] > max_det:
-                    i = i[:max_det]
-                output[xi] = x[i]
-        
-        return output
-    
-    def xywh2xyxy(self, x):
-        """Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2]"""
-        y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
-        y[:, 0] = x[:, 0] - x[:, 2] / 2  # x1
-        y[:, 1] = x[:, 1] - x[:, 3] / 2  # y1
-        y[:, 2] = x[:, 0] + x[:, 2] / 2  # x2
-        y[:, 3] = x[:, 1] + x[:, 3] / 2  # y2
-        return y
-    
-    def scale_coords(self, img1_shape, coords, img0_shape, ratio_pad=None):
-        """Rescale coords (xyxy) from img1_shape to img0_shape"""
-        if ratio_pad is None:
-            gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])
-            pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2
-        else:
-            gain = ratio_pad[0]
-            pad = ratio_pad[1]
-        
-        coords[:, [0, 2]] -= pad[0]
-        coords[:, [1, 3]] -= pad[1]
-        coords[:, :4] /= gain
-        
-        # Clip bounding boxes
-        coords[:, [0, 2]] = coords[:, [0, 2]].clip(0, img0_shape[1])
-        coords[:, [1, 3]] = coords[:, [1, 3]].clip(0, img0_shape[0])
-        
-        return coords
-    
-    def detect(self, img):
+    def detect(self, img0):
         """
-        Run detection on image
+        Run detection on image using YOLOv7's official functions
         
         Args:
-            img: Input image (BGR format)
+            img0: Input image (BGR format)
             
         Returns:
             detections: List of detections [x1, y1, x2, y2, conf, cls]
         """
-        img0 = img.copy()
-        img_processed, ratio, pad = self.preprocess(img)
+        # Preprocess
+        img = self.preprocess(img0)
         
         # Inference
         with torch.no_grad():
-            pred = self.model(img_processed)[0]
+            pred = self.model(img, augment=False)[0]
         
-        # NMS
-        pred = self.non_max_suppression(pred, self.conf_threshold, self.iou_threshold)
+        # Apply NMS using YOLOv7's function
+        pred = non_max_suppression(pred, self.conf_threshold, self.iou_threshold, classes=None, agnostic=False)
         
         # Process detections
         detections = []
-        for det in pred:
+        for i, det in enumerate(pred):  # detections per image
             if len(det):
-                det[:, :4] = self.scale_coords(img_processed.shape[2:], det[:, :4], img0.shape, (ratio, pad)).round()
+                # Rescale boxes from img_size to img0 size
+                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], img0.shape).round()
                 detections = det.cpu().numpy()
         
         return detections
     
     def draw_detections(self, img, detections):
-        """Draw bounding boxes and labels on image"""
-        for det in detections:
-            x1, y1, x2, y2, conf, cls = det
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            cls = int(cls)
-            
-            # Draw box
-            color = self.get_color(cls)
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw label
-            label = f'{self.names[cls]} {conf:.2f}'
-            t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-            cv2.rectangle(img, (x1, y1 - t_size[1] - 4), (x1 + t_size[0], y1), color, -1)
-            cv2.putText(img, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        """Draw bounding boxes and labels on image using YOLOv7's plot_one_box"""
+        if YOLOV7_AVAILABLE:
+            # Use YOLOv7's plotting function
+            for det in detections:
+                x1, y1, x2, y2, conf, cls = det
+                cls = int(cls)
+                label = f'{self.names[cls]} {conf:.2f}'
+                plot_one_box([x1, y1, x2, y2], img, label=label, color=self.get_color(cls), line_thickness=2)
+        else:
+            # Fallback to basic drawing
+            for det in detections:
+                x1, y1, x2, y2, conf, cls = det
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                cls = int(cls)
+                
+                # Draw box
+                color = self.get_color(cls)
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                
+                # Draw label
+                label = f'{self.names[cls]} {conf:.2f}'
+                t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                cv2.rectangle(img, (x1, y1 - t_size[1] - 4), (x1 + t_size[0], y1), color, -1)
+                cv2.putText(img, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return img
     
@@ -386,7 +341,7 @@ def inference_webcam(detector, camera_id=0):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='YOLOv7 Inference Script')
+    parser = argparse.ArgumentParser(description='YOLOv7 Inference Script using Official Repository')
     parser.add_argument('--model', type=str, default='models/yolov7.pt', help='Path to YOLOv7 model')
     parser.add_argument('--source', type=str, default='0', help='Image/video path or webcam (0, 1, ...)')
     parser.add_argument('--output', type=str, default=None, help='Output path for result')
@@ -396,6 +351,16 @@ def main():
     parser.add_argument('--no-show', action='store_true', help='Do not display results')
     
     args = parser.parse_args()
+    
+    # Check if YOLOv7 source is available
+    if not YOLOV7_AVAILABLE:
+        print("Error: YOLOv7 source code not found!")
+        print(f"Please ensure 'yolov7-main' folder exists at: {YOLOV7_PATH}")
+        print("\nTo fix this:")
+        print("1. Download YOLOv7 from: https://github.com/WongKinYiu/yolov7")
+        print("2. Extract to 'yolov7-main' folder in the same directory as this script")
+        print("3. Install YOLOv7 requirements: pip install -r yolov7-main/requirements.txt")
+        return
     
     # Check if model exists
     if not Path(args.model).exists():
@@ -407,15 +372,22 @@ def main():
                 print(f"  - {model_file}")
         else:
             print("Models folder not found. Please create 'models' folder and add .pt files.")
+        print("\nYou can download YOLOv7 models from:")
+        print("https://github.com/WongKinYiu/yolov7/releases")
         return
     
-    # Initialize detector
-    detector = YOLOv7Detector(
-        model_path=args.model,
-        conf_threshold=args.conf,
-        iou_threshold=args.iou,
-        device=args.device
-    )
+    try:
+        # Initialize detector
+        detector = YOLOv7Detector(
+            model_path=args.model,
+            conf_threshold=args.conf,
+            iou_threshold=args.iou,
+            device=args.device
+        )
+    except Exception as e:
+        print(f"Error initializing YOLOv7 detector: {e}")
+        print("Make sure the model file is compatible with YOLOv7")
+        return
     
     # Determine source type
     source = args.source
