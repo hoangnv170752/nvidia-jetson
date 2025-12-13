@@ -1,0 +1,12 @@
+# Requirements for YOLO Inference Scripts
+
+# Common dependencies
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# For YOLOv7
+torch>=2.0.0
+torchvision>=0.15.0
+
+# For YOLO11
+ultralytics>=8.0.0
