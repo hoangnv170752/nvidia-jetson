@@ -11,6 +11,8 @@ import numpy as np
 from pathlib import Path
 import argparse
 import time
+import subprocess
+import threading
 
 # Add YOLOv7 source to path
 YOLOV7_PATH = Path(__file__).parent / 'yolov7-main'
@@ -35,10 +37,63 @@ else:
     YOLOV7_AVAILABLE = False
 
 
+def get_jetson_gpu_stats():
+    """Get Jetson GPU utilization and memory usage"""
+    try:
+        # Try to get GPU stats using tegrastats (Jetson-specific)
+        result = subprocess.run(['tegrastats', '--interval', '100'], 
+                              capture_output=True, text=True, timeout=0.2)
+        if result.returncode == 0:
+            # Parse tegrastats output for GPU usage
+            lines = result.stdout.strip().split('\n')
+            if lines:
+                line = lines[-1]  # Get last line
+                if 'GR3D_FREQ' in line:
+                    # Extract GPU frequency and usage
+                    parts = line.split()
+                    for i, part in enumerate(parts):
+                        if 'GR3D_FREQ' in part and i + 1 < len(parts):
+                            gpu_freq = parts[i + 1].replace('%', '')
+                            return {'gpu_util': gpu_freq, 'available': True}
+    except:
+        pass
+    
+    # Fallback to nvidia-ml-py if available
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return {
+            'gpu_util': f"{gpu_util.gpu}%",
+            'mem_used': f"{mem_info.used / 1024**2:.0f}MB",
+            'mem_total': f"{mem_info.total / 1024**2:.0f}MB",
+            'available': True
+        }
+    except:
+        pass
+    
+    # Basic PyTorch GPU info
+    if torch.cuda.is_available():
+        try:
+            mem_allocated = torch.cuda.memory_allocated(0) / 1024**2
+            mem_reserved = torch.cuda.memory_reserved(0) / 1024**2
+            return {
+                'mem_allocated': f"{mem_allocated:.0f}MB",
+                'mem_reserved': f"{mem_reserved:.0f}MB",
+                'available': True
+            }
+        except:
+            pass
+    
+    return {'available': False}
+
+
 class YOLOv7Detector:
     def __init__(self, model_path, conf_threshold=0.25, iou_threshold=0.45, device=''):
         """
-        Initialize YOLOv7 detector using official YOLOv7 repository
+        Initialize YOLOv7 detector optimized for Jetson Nano Orin GPU
         
         Args:
             model_path: Path to YOLOv7 .pt model file
@@ -52,8 +107,20 @@ class YOLOv7Detector:
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         
+        # Jetson Nano Orin GPU optimization
+        if device == '' and torch.cuda.is_available():
+            device = '0'  # Force GPU usage on Jetson
+            print("Jetson GPU detected, forcing CUDA device 0")
+        
         # Set device using YOLOv7's select_device function
         self.device = select_device(device)
+        
+        # Jetson-specific CUDA optimizations
+        if self.device.type != 'cpu':
+            torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+            torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for better performance
+            print(f"CUDA optimizations enabled for Jetson")
+            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
         
         print(f"Loading YOLOv7 model from {model_path}")
         print(f"Using device: {self.device}")
@@ -67,11 +134,34 @@ class YOLOv7Detector:
         # Check image size
         self.img_size = check_img_size(self.img_size, s=self.stride)
         
+        # Jetson optimization: Set model to half precision if GPU available
+        if self.device.type != 'cpu':
+            try:
+                self.model.half()  # Convert to FP16 for better Jetson performance
+                self.use_half = True
+                print("Model converted to FP16 for Jetson optimization")
+            except:
+                self.use_half = False
+                print("FP16 conversion failed, using FP32")
+        else:
+            self.use_half = False
+        
+        # Warm up the model
+        if self.device.type != 'cpu':
+            print("Warming up GPU...")
+            dummy_input = torch.zeros(1, 3, self.img_size, self.img_size).to(self.device)
+            if self.use_half:
+                dummy_input = dummy_input.half()
+            with torch.no_grad():
+                _ = self.model(dummy_input)
+            print("GPU warm-up complete")
+        
         print(f"Model loaded successfully. Classes: {len(self.names)}")
         print(f"Image size: {self.img_size}, Stride: {self.stride}")
+        print(f"Half precision: {self.use_half}")
     
     def preprocess(self, img0):
-        """Preprocess image for inference using YOLOv7's letterbox function"""
+        """Preprocess image for inference using YOLOv7's letterbox function with Jetson optimization"""
         # Letterbox
         img = letterbox(img0, self.img_size, stride=self.stride)[0]
         
@@ -80,8 +170,13 @@ class YOLOv7Detector:
         img = np.ascontiguousarray(img)
         
         # Convert to tensor
-        img = torch.from_numpy(img).to(self.device)
+        img = torch.from_numpy(img).to(self.device, non_blocking=True)  # Non-blocking transfer for Jetson
         img = img.float() / 255.0  # 0 - 255 to 0.0 - 1.0
+        
+        # Convert to half precision if enabled
+        if self.use_half:
+            img = img.half()
+            
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
         
@@ -89,7 +184,7 @@ class YOLOv7Detector:
     
     def detect(self, img0):
         """
-        Run detection on image using YOLOv7's official functions
+        Run detection on image using YOLOv7's official functions with Jetson GPU optimization
         
         Args:
             img0: Input image (BGR format)
@@ -100,9 +195,14 @@ class YOLOv7Detector:
         # Preprocess
         img = self.preprocess(img0)
         
-        # Inference
+        # Inference with GPU optimization
         with torch.no_grad():
-            pred = self.model(img, augment=False)[0]
+            if self.device.type != 'cpu':
+                # Use CUDA stream for better performance on Jetson
+                with torch.cuda.device(self.device):
+                    pred = self.model(img, augment=False)[0]
+            else:
+                pred = self.model(img, augment=False)[0]
         
         # Apply NMS using YOLOv7's function
         pred = non_max_suppression(pred, self.conf_threshold, self.iou_threshold, classes=None, agnostic=False)
@@ -274,10 +374,17 @@ def inference_video(detector, video_path, output_path=None, show=True):
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
         
-        # Print detailed progress
+        # Print detailed progress with GPU stats
         if frame_count % 30 == 0:
             avg_fps_recent = sum(fps_history[-30:]) / min(30, len(fps_history))
-            print(f"Frame {frame_count}/{total_frames} | FPS: {current_fps:.1f} (avg: {avg_fps_recent:.1f}) | Detections: {frame_detections} | Progress: {progress*100:.1f}%")
+            gpu_stats = get_jetson_gpu_stats()
+            gpu_info = ""
+            if gpu_stats['available']:
+                if 'gpu_util' in gpu_stats:
+                    gpu_info = f" | GPU: {gpu_stats['gpu_util']}"
+                if 'mem_allocated' in gpu_stats:
+                    gpu_info += f" | GPU Mem: {gpu_stats['mem_allocated']}"
+            print(f"Frame {frame_count}/{total_frames} | FPS: {current_fps:.1f} (avg: {avg_fps_recent:.1f}) | Detections: {frame_detections}{gpu_info} | Progress: {progress*100:.1f}%")
     
     cap.release()
     if writer:
