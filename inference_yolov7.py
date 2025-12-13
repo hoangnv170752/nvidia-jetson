@@ -230,7 +230,7 @@ def inference_image(detector, image_path, output_path=None, show=True):
 
 
 def inference_video(detector, video_path, output_path=None, show=True):
-    """Run inference on video"""
+    """Run inference on video with comprehensive metrics"""
     print(f"\nProcessing video: {video_path}")
     
     cap = cv2.VideoCapture(video_path)
@@ -242,6 +242,9 @@ def inference_video(detector, video_path, output_path=None, show=True):
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    print(f"Video info: {width}x{height}, {fps} FPS, {total_frames} frames")
     
     # Setup video writer
     writer = None
@@ -249,8 +252,14 @@ def inference_video(detector, video_path, output_path=None, show=True):
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
+    # Metrics tracking
     frame_count = 0
     total_time = 0
+    total_detections = 0
+    confidence_scores = []
+    fps_history = []
+    
+    print("Processing frames... Press 'q' to quit")
     
     while True:
         ret, frame = cap.read()
@@ -264,12 +273,42 @@ def inference_video(detector, video_path, output_path=None, show=True):
         total_time += inference_time
         frame_count += 1
         
+        # Get detection metrics
+        frame_detections = len(detections)
+        total_detections += frame_detections
+        
+        # Collect confidence scores
+        for det in detections:
+            confidence_scores.append(det[4])  # confidence is at index 4 in YOLOv7
+        
+        # Calculate current FPS
+        current_fps = 1/inference_time if inference_time > 0 else 0
+        fps_history.append(current_fps)
+        
         # Draw results
         frame_result = detector.draw_detections(frame, detections)
         
-        # Add FPS info
-        fps_text = f"FPS: {1/inference_time:.1f}"
-        cv2.putText(frame_result, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # Add comprehensive metrics overlay
+        y_offset = 30
+        cv2.putText(frame_result, f"FPS: {current_fps:.1f}", (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        y_offset += 30
+        cv2.putText(frame_result, f"Detections: {frame_detections}", (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        y_offset += 30
+        cv2.putText(frame_result, f"Frame: {frame_count}/{total_frames}", (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        if confidence_scores:
+            avg_conf = sum(confidence_scores[-frame_detections:]) / max(1, frame_detections)
+            y_offset += 30
+            cv2.putText(frame_result, f"Avg Conf: {avg_conf:.2f}", (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Progress bar
+        progress = frame_count / total_frames
+        bar_width = 300
+        bar_height = 10
+        bar_x, bar_y = 10, height - 30
+        cv2.rectangle(frame_result, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
+        cv2.rectangle(frame_result, (bar_x, bar_y), (bar_x + int(bar_width * progress), bar_y + bar_height), (0, 255, 0), -1)
+        cv2.putText(frame_result, f"Progress: {progress*100:.1f}%", (bar_x + bar_width + 10, bar_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         # Write or show
         if writer:
@@ -279,17 +318,36 @@ def inference_video(detector, video_path, output_path=None, show=True):
             cv2.imshow('YOLOv7 Detection', frame_result)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+        
+        # Print detailed progress
+        if frame_count % 30 == 0:
+            avg_fps_recent = sum(fps_history[-30:]) / min(30, len(fps_history))
+            print(f"Frame {frame_count}/{total_frames} | FPS: {current_fps:.1f} (avg: {avg_fps_recent:.1f}) | Detections: {frame_detections} | Progress: {progress*100:.1f}%")
     
     cap.release()
     if writer:
         writer.release()
     cv2.destroyAllWindows()
     
+    # Final statistics
     avg_fps = frame_count / total_time if total_time > 0 else 0
-    print(f"\nProcessed {frame_count} frames")
+    avg_detections_per_frame = total_detections / frame_count if frame_count > 0 else 0
+    avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0
+    
+    print(f"\n{'='*50}")
+    print(f"VIDEO PROCESSING COMPLETE")
+    print(f"{'='*50}")
+    print(f"Total frames processed: {frame_count}")
+    print(f"Total processing time: {total_time:.2f}s")
     print(f"Average FPS: {avg_fps:.2f}")
+    print(f"Total detections: {total_detections}")
+    print(f"Average detections per frame: {avg_detections_per_frame:.2f}")
+    print(f"Average confidence score: {avg_confidence:.3f}")
+    print(f"Min FPS: {min(fps_history):.1f}")
+    print(f"Max FPS: {max(fps_history):.1f}")
     if output_path:
-        print(f"Saved result to {output_path}")
+        print(f"Output saved to: {output_path}")
+    print(f"{'='*50}")
 
 
 def inference_webcam(detector, camera_id=0):
@@ -339,6 +397,18 @@ def main():
     
     args = parser.parse_args()
     
+    # Check if model exists
+    if not Path(args.model).exists():
+        print(f"Error: Model file not found: {args.model}")
+        print("\nAvailable models in 'models' folder:")
+        models_dir = Path('models')
+        if models_dir.exists():
+            for model_file in models_dir.glob('*.pt'):
+                print(f"  - {model_file}")
+        else:
+            print("Models folder not found. Please create 'models' folder and add .pt files.")
+        return
+    
     # Initialize detector
     detector = YOLOv7Detector(
         model_path=args.model,
@@ -354,14 +424,20 @@ def main():
     if source.isdigit():
         # Webcam
         inference_webcam(detector, int(source))
-    elif Path(source).suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
-        # Image
-        inference_image(detector, source, args.output, show)
-    elif Path(source).suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv']:
-        # Video
-        inference_video(detector, source, args.output, show)
+    elif Path(source).exists():
+        if Path(source).suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
+            # Image
+            inference_image(detector, source, args.output, show)
+        elif Path(source).suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv', '.wmv']:
+            # Video
+            inference_video(detector, source, args.output, show)
+        else:
+            print(f"Error: Unsupported file type: {source}")
+            print("Supported formats: Images (.jpg, .jpeg, .png, .bmp, .webp)")
+            print("                   Videos (.mp4, .avi, .mov, .mkv, .wmv)")
     else:
-        print(f"Error: Unsupported source type: {source}")
+        print(f"Error: Source not found: {source}")
+        print("Please check the file path or use webcam (0, 1, 2, ...)")
 
 
 if __name__ == '__main__':
